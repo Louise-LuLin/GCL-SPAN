@@ -101,7 +101,7 @@ class LogisticRegression(nn.Module):
 
 
 class LREvaluator(BaseEvaluator):
-    def __init__(self, num_epochs: int = 5000, learning_rate: float = 0.01,
+    def __init__(self, num_epochs: int = 5000, learning_rate: float = 0.001,
                  weight_decay: float = 0.0, test_interval: int = 20):
         self.num_epochs = num_epochs
         self.learning_rate = learning_rate
@@ -118,15 +118,16 @@ class LREvaluator(BaseEvaluator):
         optimizer = Adam(classifier.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay)
         output_fn = nn.LogSoftmax(dim=-1)
         criterion = nn.NLLLoss()
-
-        best_val_micro = 0
+        
         best_val_acc = 0
+        best_val_micro = 0
+        best_val_macro = 0
         best_test_acc = 0
         best_test_micro = 0
         best_test_macro = 0
         best_epoch = 0
 
-        with tqdm(total=self.num_epochs, desc='(LR)',
+        with tqdm(total=self.num_epochs, desc='(LR)+{:.4f}decay'.format(self.weight_decay),
                   bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}{postfix}]') as pbar:
             for epoch in range(self.num_epochs):
                 classifier.train()
@@ -148,18 +149,20 @@ class LREvaluator(BaseEvaluator):
 
                     y_val = y[split['valid']].detach().cpu().numpy()
                     y_pred = classifier(x[split['valid']]).argmax(-1).detach().cpu().numpy()
-                    val_micro = f1_score(y_val, y_pred, average='micro')
                     val_acc = accuracy_score(y_val, y_pred)
+                    val_micro = f1_score(y_val, y_pred, average='micro')
+                    val_macro = f1_score(y_val, y_pred, average='macro')
 
                     if val_acc > best_val_acc:
                         best_val_acc = val_acc
                         best_val_micro = val_micro
+                        best_val_macro = val_macro
                         best_test_acc = test_acc
                         best_test_micro = test_micro
                         best_test_macro = test_macro
                         best_epoch = epoch
 
-                    pbar.set_postfix({'best test accuracy': best_test_acc, 
+                    pbar.set_postfix({'Test accuracy': best_test_acc, 
                                       'F1Mi': best_test_micro, 
                                       'F1Ma': best_test_macro})
                     pbar.update(self.test_interval)
@@ -167,7 +170,10 @@ class LREvaluator(BaseEvaluator):
         return {
             'accuracy': best_test_acc,
             'micro_f1': best_test_micro,
-            'macro_f1': best_test_macro
+            'macro_f1': best_test_macro,
+            'accuracy_val': best_val_acc,
+            'micro_f1_val': best_val_micro,
+            'macro_f1_val': best_val_macro
         }
 
 

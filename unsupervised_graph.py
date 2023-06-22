@@ -1,3 +1,5 @@
+# This is the usecase for graph classification task with minibatch training
+
 import argparse
 import numpy as np
 import random
@@ -15,12 +17,14 @@ from torch_geometric.nn import GCNConv, global_add_pool
 from torch_geometric.nn.inits import uniform
 from torch_geometric.loader import DataLoader
 from torch_geometric.datasets import TUDataset
+
 from utils import seed_everything
-    
-from Loss import JSD, HardnessJSD 
-from Evaluator import get_split, from_predefined_split, LREvaluator, SVMEvaluator
+from Loss import JSD 
+from Evaluator import get_split, LREvaluator
 from ContrastMode import DualBranchContrast
-from Augmentor import Compose, FeatureAugmentor, SpectralAugmentor
+from Augmentor import SpectralAugmentor
+
+###################### Backbone Model ######################
 
 class GConv(nn.Module):
     def __init__(self, input_dim, hidden_dim, num_layers):
@@ -61,6 +65,8 @@ class FC(nn.Module):
     def forward(self, x):
         return self.fc(x) + self.linear(x)
 
+    
+###################### GCL Encoder ######################
 
 class Encoder(torch.nn.Module):
     def __init__(self, gcn1, gcn2, mlp1, mlp2, aug1, aug2):
@@ -74,25 +80,19 @@ class Encoder(torch.nn.Module):
 
     def forward(self, data):
         x, edge_index, batch = data.x, data.edge_index, data.batch
-        ptb_edge_idx1, ptb_edge_prob1 = data.max_idx, data.max_prob
-        ptb_edge_idx2, ptb_edge_prob2 = data.min_idx, data.min_prob
+        ptb_prob1 = data.max
+        ptb_prob2 = data.min
         
-        print(data)
-        print(x.shape, ptb_edge_idx1.shape, ptb_edge_prob1.shape)
-        
-        ls = data.to_data_list()
-        for d in ls:
-            print(d)
-        exit()
-        
-        x1, edge_index1 = self.aug1((x, edge_index, ptb_edge_idx1, ptb_edge_prob1), batch)
-        x2, edge_index2 = self.aug2((x, edge_index, ptb_edge_idx2, ptb_edge_prob2), batch)
+        x1, edge_index1, _ = self.aug1(x, edge_index, ptb_prob1, batch)
+        x2, edge_index2, _ = self.aug2(x, edge_index, ptb_prob2, batch)
         z1, g1 = self.gcn1(x1, edge_index1, batch)
         z2, g2 = self.gcn2(x2, edge_index2, batch)
         h1, h2 = [self.mlp1(h) for h in [z1, z2]]
         g1, g2 = [self.mlp2(g) for g in [g1, g2]]
         return h1, h2, g1, g2
 
+
+###################### GCL Training and Testing ######################
 
 def train(encoder_model, contrast_model, dataloader, optimizer, device):
     encoder_model.train()
@@ -113,7 +113,6 @@ def train(encoder_model, contrast_model, dataloader, optimizer, device):
         epoch_loss += loss.item()
     return epoch_loss
 
-
 def test(encoder_model, dataloader, device):
     encoder_model.eval()
     x = []
@@ -123,7 +122,7 @@ def test(encoder_model, dataloader, device):
         if data.x is None:
             num_nodes = data.batch.size(0)
             data.x = torch.ones((num_nodes, 1), dtype=torch.float32, device=data.batch.device)
-        _, _, g1, g2 = encoder_model(data.x, data.edge_index, data.batch)
+        _, _, g1, g2 = encoder_model(data)
         x.append(g1 + g2)
         y.append(data.y)
     x = torch.cat(x, dim=0)
@@ -131,75 +130,81 @@ def test(encoder_model, dataloader, device):
 
     split = get_split(num_samples=x.size()[0], train_ratio=0.8, test_ratio=0.1)
     # result = SVMEvaluator(linear=True)(x, y, split)
-    result = LREvaluator()(x, y, split)
-    return result
-
+    
+    best_result = {
+        'accuracy': 0,
+        'micro_f1': 0,
+        'macro_f1': 0,
+        'accuracy_val': 0,
+        'micro_f1_val': 0,
+        'macro_f1_val': 0
+    }
+    for decay in [0.0, 0.001, 0.01, 0.1, 0.5, 1.0, 5.0]:
+        result = LREvaluator(weight_decay=decay)(x, y, split)
+        if result['accuracy_val'] > best_result['accuracy_val']:
+            best_result = result
+    return best_result
 
 def arg_parse():
     parser = argparse.ArgumentParser()
-
-    parser.add_argument('--dataset', type=str, default='MUTAG') 
-    parser.add_argument('--epoch', type=int, default=200)
-    parser.add_argument('--aug_lr1', type=float, default=100, help='augmentation learning rate.')
-    parser.add_argument('--aug_lr2', type=float, default=0.5, help='augmentation learning rate.')
-    parser.add_argument('--aug_iter', type=int, default=30, help='iteration for augmentation.')
-    parser.add_argument('--pf', type=float, default=0.4, help='feature probability')
-    parser.add_argument('--pe', type=float, default=0.2, help='edge probability')
-    
-    parser.add_argument('--check', type=str, default='no') 
-    parser.add_argument('--out_dir', type=str, default='../exp_MVGRL')
-    parser.add_argument('--seed', type=int, default=15, help='Random seed.')
+    parser.add_argument('--seed', type=int, default=15, help='Random seed')
     parser.add_argument('--device', type=int, default=0, help='cuda')
-    
-    
+    parser.add_argument('--dataset', type=str, default='MUTAG') 
+    parser.add_argument('--epoch', type=int, default=100)
+    parser.add_argument('--aug_lr1', type=float, default=0.5, help='augmentation learning rate for spectral max')
+    parser.add_argument('--aug_lr2', type=float, default=0.5, help='augmentation learning rate for spectral min')
+    parser.add_argument('--aug_iter', type=int, default=20, help='iteration for augmentation')
+    parser.add_argument('--pf', type=float, default=0.4, help='feature masking probability')
+    parser.add_argument('--pe', type=float, default=0.2, help='edge perturbation probability')
     return parser.parse_args()
 
-
 def main():
-    
     args = arg_parse()
     
     seed_everything(args.seed)
     device = torch.device('cuda:{}'.format(args.device) if torch.cuda.is_available() else "cpu")
-    torch.set_num_threads(1) # limit cpu use   
+    torch.set_num_threads(1)
 
     # Load dataset
-    path = osp.join(osp.expanduser('~'), 'datasets')
+    path = osp.join(osp.expanduser('/data/lu/'), 'datasets')
     dataset = TUDataset(path, name=args.dataset)
     
     # Initialize augmentor
-    aug1 = SpectralAugmentor(ratio=args.pe, 
-                                     lr=args.aug_lr1,
-                                     iteration=args.aug_iter,
-                                     dis_type='max',
-                                     device=device)
+    aug1 = SpectralAugmentor(
+        ratio=args.pe,
+        lr=args.aug_lr1,
+        iteration=args.aug_iter,
+        dis_type='max',
+        device=device
+    )
     
-    aug2 = SpectralAugmentor(ratio=args.pe, 
-                                     lr=args.aug_lr2,
-                                     iteration=args.aug_iter,
-                                     dis_type='min',
-                                     device=device)
+    aug2 = SpectralAugmentor(
+        ratio=args.pe,
+        lr=args.aug_lr2,
+        iteration=args.aug_iter,
+        dis_type='min',
+        device=device
+    )
     
-    update_data_path = osp.join(path, args.dataset+'/updated.pt')
-    # Load precomputed probability matrix
-    if os.path.exists(update_data_path):
+    # Pre-compute the perturbation probability or load the saved probability
+    update_data_path = osp.join(path, args.dataset+'/updated_{}_{}_{}.pt'.format(args.aug_lr1, args.aug_lr2, args.pe))
+    if os.path.exists(update_data_path):  # Load saved probability matrix
         update_data_ls = torch.load(update_data_path)
-        print('(L): perturbation probability loaded!')
-    # Precompute augmentation probability matrix and save it to file
-    else:
-        print('(L): precomputing probability ...')
+        print('(A): perturbation probability loaded!')
+    else:  # Pre-compute perturbation probability matrix and save it to file
+        print('(A): precomputing probability ...')
+        assert dataset.len() > 1  # should have multiple data object for graph classification
         update_data_ls = []
-        for i in range(dataset.len()):
+        for i in tqdm(range(dataset.len())):
             data = dataset.get(i)        
-            aug1.calc_prob(data) # note that data is updated with data['max']=xx
-            aug2.calc_prob(data) # note that data is further updated with data['min']=xx
+            aug1.calc_prob(data, silence=True) # note that data is updated with data['max']=ptb_prob1
+            aug2.calc_prob(data, silence=True) # note that data is further updated with data['min']=ptb_prob2
             update_data_ls.append(data)
-        # Save the updated data to reduce recomputation
+        # Save the updated data to re-use in future
         torch.save(update_data_ls, update_data_path)
     
-    dataloader = DataLoader(update_data_ls, batch_size=2)
-    
-    # Start GCL
+    # Start GCL training
+    dataloader = DataLoader(update_data_ls, batch_size=32)  # batch size should be larger than 1
     gcn1 = GConv(input_dim=max(dataset.num_features, 1), hidden_dim=512, num_layers=2).to(device)
     gcn2 = GConv(input_dim=max(dataset.num_features, 1), hidden_dim=512, num_layers=2).to(device)
     mlp1 = FC(input_dim=512, output_dim=512)
@@ -215,7 +220,7 @@ def main():
             pbar.update()
 
     test_result = test(encoder_model, dataloader, device)
-    print(f'(E): Best test accuracy={test_result["accuracy"]:.4f}, F1Mi={test_result["micro_f1"]:.4f}, F1Ma={test_result["macro_f1"]:.4f}')
+    print(f'(E): Test accuracy={test_result["accuracy"]:.4f}, F1Mi={test_result["micro_f1"]:.4f}, F1Ma={test_result["macro_f1"]:.4f}')
 
 if __name__ == '__main__':
     main()

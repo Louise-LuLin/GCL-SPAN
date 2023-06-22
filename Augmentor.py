@@ -6,12 +6,17 @@ from abc import ABC, abstractmethod
 from typing import Optional, Tuple, NamedTuple, List
 
 from tqdm import tqdm
+import pickle as pkl
+import os
 import numpy as np
 import torch
 from torch.nn.parameter import Parameter
+from torch_sparse import SparseTensor
+
+from torch_geometric.utils.sparse import to_edge_index
+from torch_geometric.utils import unbatch, unbatch_edge_index
+from torch_geometric.data import Batch, Data
 from utils import get_adj_tensor, get_normalize_adj_tensor, to_dense_adj, dense_to_sparse, switch_edge, drop_feature
-import pickle as pkl
-import os
 
 
 ###################### Base Class ######################
@@ -19,11 +24,10 @@ import os
 class Graph(NamedTuple):
     x: torch.FloatTensor
     edge_index: torch.LongTensor
-    ptb_edge_idx: Optional[torch.LongTensor]
-    ptb_edge_prob: Optional[torch.FloatTensor]
+    ptb_prob: Optional[SparseTensor]
 
-    def unfold(self) -> Tuple[torch.FloatTensor, torch.LongTensor, Optional[torch.LongTensor], Optional[torch.FloatTensor]]:
-        return self.x, self.edge_index, self.ptb_edge_idx, self.ptb_edge_prob
+    def unfold(self) -> Tuple[torch.FloatTensor, torch.LongTensor, Optional[SparseTensor]]:
+        return self.x, self.edge_index, self.ptb_prob
 
 
 class Augmentor(ABC):
@@ -36,12 +40,13 @@ class Augmentor(ABC):
         raise NotImplementedError(f"GraphAug.augment should be implemented.")
 
     def __call__(
-            self, x: torch.FloatTensor, edge_index: torch.LongTensor, 
-            ptb_edge_idx: Optional[torch.LongTensor] = None, 
-            ptb_edge_prob: Optional[torch.FloatTensor] = None, 
-            batch = None
+        self, 
+        x: torch.FloatTensor, 
+        edge_index: torch.LongTensor, 
+        ptb_prob: Optional[SparseTensor] = None, 
+        batch = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        return self.augment(Graph(x, edge_index, ptb_edge_idx, ptb_edge_prob), batch).unfold()
+        return self.augment(Graph(x, edge_index, ptb_prob), batch).unfold()
     
     
 ###################### Customized Class ######################
@@ -65,9 +70,9 @@ class FeatureAugmentor(Augmentor):
         self.pf = pf
 
     def augment(self, g: Graph, batch: torch.Tensor) -> Graph:
-        x, edge_index = g.unfold()
+        x, edge_index, _ = g.unfold()
         x = drop_feature(x, self.pf)
-        return Graph(x=x, edge_index=edge_index)
+        return Graph(x=x, edge_index=edge_index, ptb_prob=None)
 
     def get_aug_name(self):
         return 'feature'
@@ -75,7 +80,7 @@ class FeatureAugmentor(Augmentor):
 # spectral augmentor
 class SpectralAugmentor(Augmentor):
     
-    def __init__(self, ratio, lr, iteration, dis_type, device, sample='no'):
+    def __init__(self, ratio, lr, iteration, dis_type, device, sample='no', threshold=0.5):
         super(SpectralAugmentor, self).__init__()
         
         self.ratio = ratio
@@ -84,12 +89,13 @@ class SpectralAugmentor(Augmentor):
         self.dis_type = dis_type
         self.device = device
         self.sample = sample
+        self.threshold = threshold
                 
     def get_aug_name(self):
         return self.dis_type
     
     # precompute the perturbation propability based on spectral change
-    def calc_prob(self, data, check='no', save='no', verbose=False):
+    def calc_prob(self, data, check='no', save='no', verbose=False, silence=False):
         x, edge_index = data.x, data.edge_index
         x = x.to(self.device)
         ori_adj = get_adj_tensor(edge_index.cpu()).to(self.device)
@@ -97,7 +103,7 @@ class SpectralAugmentor(Augmentor):
         
         nnodes = ori_adj.shape[0]
         adj_changes = Parameter(torch.FloatTensor(int(nnodes*(nnodes-1)/2)), requires_grad=True).to(self.device)
-        torch.nn.init.uniform_(adj_changes, 0.0, 0.001)
+        torch.nn.init.uniform_(adj_changes, 1e-5, 1./nnodes)
         
         ori_adj_norm = get_normalize_adj_tensor(ori_adj, device=self.device)
         ori_e = torch.linalg.eigvalsh(ori_adj_norm)
@@ -105,7 +111,7 @@ class SpectralAugmentor(Augmentor):
         eigen_norm = torch.norm(ori_e)
         
         n_perturbations = int(self.ratio * (ori_adj.sum()/2))
-        with tqdm(total=self.iteration, desc='Spectral Augment-'+self.dis_type) as pbar:
+        with tqdm(total=self.iteration, desc='Spectral Augment-'+self.dis_type, disable=silence) as pbar:
             verb = max(1, int(self.iteration/10))
             for t in range(1, self.iteration+1):
                 modified_adj = self.get_modified_adj(ori_adj, self.reshape_m(nnodes, adj_changes))
@@ -251,10 +257,7 @@ class SpectralAugmentor(Augmentor):
                 pbar.set_postfix({'reg_loss': reg_loss.item(), 'budget': n_perturbations, 'b_proj': before_p.item(), 'a_proj': after_p.item()})
                 pbar.update()
     
-        # turn adj_changes to ori_adj shape and store it in data object
-        ptb_edge_index, ptb_prob = dense_to_sparse(self.reshape_m(nnodes, adj_changes))
-        data[self.dis_type+'_idx'] = ptb_edge_index
-        data[self.dis_type+'_prob'] = ptb_prob
+        data[self.dis_type] = SparseTensor.from_dense(self.reshape_m(nnodes, adj_changes))
     
 #         if check == 'yes':
 #             self.check_changes(ori_adj, adj_changes, y)
@@ -271,25 +274,35 @@ class SpectralAugmentor(Augmentor):
         return data
                 
     def augment(self, g: Graph, batch: torch.Tensor) -> Graph:
-        x, edge_index, ptb_edge_idx, ptb_edge_prob = g.unfold()
-                
-        # ori_adj = get_adj_tensor(edge_index.cpu()).to(self.device)
-        ori_adj = to_dense_adj(edge_index, batch)
-        ptb_m = to_dense_adj(ptb_edge_idx, batch, ptb_edge_prob)
-                
+        x, edge_index, ptb_prob = g.unfold()
+
+        ori_adj = to_dense_adj(edge_index, batch) 
+        ptb_idx, ptb_w = to_edge_index(ptb_prob)
+        ptb_m = to_dense_adj(ptb_idx, batch, ptb_w)
+               
         ptb_adj = self.random_sample(ptb_m)
+        
         modified_adj = self.get_modified_adj(ori_adj, ptb_adj).detach()
+        
         self.check_adj_tensor(modified_adj)
         
-        edge_index, _ = dense_to_sparse(modified_adj)
+        if batch is None: # full batch training
+            edge_index, _ = dense_to_sparse(modified_adj)
+        else:  # minibatch training
+            # edge_index, _ = dense_to_sparse(modified_adj) # Wrong! 
+            x_unbatched = unbatch(x, batch)
+            aug_data = Batch.from_data_list([Data(x=x_unbatched[b], edge_index=dense_to_sparse(modified_adj[b])[0]) for b in range(modified_adj.shape[0])])
+            x = aug_data.x
+            edge_index = aug_data.edge_index
         
-        return Graph(x=x, edge_index=edge_index)
+        return Graph(x=x, edge_index=edge_index, ptb_prob=None)
     
 
     def get_modified_adj(self, ori_adj, m):
-        nnodes = ori_adj.shape[0]
+        nnodes = ori_adj.shape[1]
         complementary = (torch.ones_like(ori_adj) - torch.eye(nnodes).to(self.device) - ori_adj) - ori_adj
         modified_adj = complementary * m + ori_adj
+        
         return modified_adj
     
     def reshape_m(self, nnodes, adj_changes):
@@ -303,10 +316,9 @@ class SpectralAugmentor(Augmentor):
         nnodes = ori_adj.shape[0]
         noise = 1e-4 * torch.rand(nnodes, nnodes).to(self.device)
         return (noise + torch.transpose(noise, 0, 1))/2.0 + ori_adj
-
     
     def projection(self, n_perturbations, adj_changes):
-        if torch.clamp(adj_changes, 0, 1).sum() > n_perturbations:
+        if torch.clamp(adj_changes, 0, self.threshold).sum() > n_perturbations:
             left = (adj_changes).min()
             right = adj_changes.max()
             miu = self.bisection(left, right, n_perturbations, 1e-4, adj_changes)
@@ -320,7 +332,7 @@ class SpectralAugmentor(Augmentor):
             
     def bisection(self, a, b, n_perturbations, epsilon, adj_changes):
         def func(x):
-            return torch.clamp(adj_changes-x, 0, 1).sum() - n_perturbations
+            return torch.clamp(adj_changes-x, 0, self.threshold).sum() - n_perturbations
 
         miu = a
         while ((b-a) >= epsilon):
@@ -375,7 +387,7 @@ class SpectralAugmentor(Augmentor):
         # assert torch.abs(adj - adj.t()).sum() == 0, "Input graph is not symmetric"
         assert adj.max() == 1, "Max value should be 1!"
         assert adj.min() == 0, "Min value should be 0!"
-        diag = adj.diag()
+        diag = adj[0].diag()
         assert diag.max() == 0, "Diagonal should be 0!"
         assert diag.min() == 0, "Diagonal should be 0!"
         
