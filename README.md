@@ -18,6 +18,15 @@ $pip install numba
 
 ## Run the code
 
+Both node classification (full batch) and graph classification (minibatch) tasks are supported:
+```
+#to launch node classification
+$python unsupervised_node.py
+
+#to launch graph classification
+$python unsupervised_graph.py
+```
+
 ## Cite
 
 Please cite our paper if you find this repo useful for your research or development.
