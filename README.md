@@ -2,8 +2,6 @@
 
 This is the code for the paper "Spectral Augmentation for Self-Supervised Learning on Graphs" accepted by ICLR 2023.
 
-## Introduction
-
 ## Requirement
 
 Code is tested in **Python 3.10.10**. Some major requirements are listed below:
@@ -17,6 +15,15 @@ $pip install numba
 ```
 
 ## Run the code
+
+Both node classification (full batch) and graph classification (minibatch) tasks are supported:
+```
+#to launch node classification
+$python unsupervised_node.py
+
+#to launch graph classification
+$python unsupervised_graph.py
+```
 
 ## Cite
 
