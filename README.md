@@ -1,6 +1,6 @@
 # GCL-SPAN
 
-This is the code for the paper "Spectral Augmentation for Self-Supervised Learning on Graphs" accepted by ICLR 2023.
+This is the code for the paper "[Spectral Augmentation for Self-Supervised Learning on Graphs](https://arxiv.org/abs/2210.00643)" accepted by ICLR 2023.
 
 ## Requirement
 
