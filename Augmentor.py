@@ -95,7 +95,7 @@ class SpectralAugmentor(Augmentor):
         return self.dis_type
     
     # precompute the perturbation propability based on spectral change
-    def calc_prob(self, data, check='no', save='no', verbose=False, silence=False):
+    def calc_prob(self, data, fast=False, check='no', save='no', verbose=False, silence=False):
         x, edge_index = data.x, data.edge_index
         x = x.to(self.device)
         ori_adj = get_adj_tensor(edge_index.cpu()).to(self.device)
@@ -106,8 +106,11 @@ class SpectralAugmentor(Augmentor):
         torch.nn.init.uniform_(adj_changes, 1e-5, 1./nnodes)
         
         ori_adj_norm = get_normalize_adj_tensor(ori_adj, device=self.device)
-        ori_e = torch.linalg.eigvalsh(ori_adj_norm)
-        # ori_e, _ = torch.symeig(ori_adj_norm)
+        
+        if fast: # only obtain k largest and/or smallest eigenvalues with faster eigendecomposition alg
+            ori_e = torch.lobpcg(ori_adj_norm, k=10, largest=True)
+        else:
+            ori_e = torch.linalg.eigvalsh(ori_adj_norm)
         eigen_norm = torch.norm(ori_e)
         
         n_perturbations = int(self.ratio * (ori_adj.sum()/2))
@@ -120,7 +123,11 @@ class SpectralAugmentor(Augmentor):
                 modified_adj_noise = modified_adj
                 # modified_adj_noise = self.add_random_noise(modified_adj)
                 adj_norm_noise = get_normalize_adj_tensor(modified_adj_noise, device=self.device)
-                e = torch.linalg.eigvalsh(adj_norm_noise)
+                
+                if fast: # only obtain k largest and/or smallest eigenvalues with faster eigendecomposition alg
+                    e = torch.lobpcg(adj_norm_noise, k=10, largest=True)
+                else: 
+                    e = torch.linalg.eigvalsh(adj_norm_noise)
                 eigen_self = torch.norm(e)
                 
                 # spectral distance
